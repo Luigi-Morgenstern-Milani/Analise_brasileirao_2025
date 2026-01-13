@@ -1,111 +1,103 @@
-from pathlib import Path
 import pandas as pd
+import os
 import matplotlib.pyplot as plt
 
-# ==================================================
-# FUNÇÃO PARA LIMPAR COLUNAS (PADRÃO FBREF)
-# ==================================================
-def ler_fbref_excel(path):
-    """
-    Lê arquivos do FBref com cabeçalho duplo
-    e retorna DataFrame com colunas simples.
-    """
-    df = pd.read_excel(path, header=[0, 1])
 
-    # Achata MultiIndex
+def ler_fbref_excel(path):
+    df = pd.read_excel(path, header=[0,1], engine="openpyxl")
+
     df.columns = [
-        col[1] if col[1] != '' and not col[1].startswith('Unnamed')
-        else col[0]
+        col[1] if not str(col[1]).startswith("Unnamed") else col[0]
         for col in df.columns
     ]
 
-    # Remove espaços invisíveis
-    df.columns = df.columns.astype(str).str.strip()
+   
+    df.columns = df.columns.astype(str).str.replace("\u00a0"," ", regex=False).str.strip()
+
+    
+    df = df.dropna(axis=1, how="all")
+    df = df.loc[:, ~df.columns.duplicated()]
+
     return df
 
 
-# ==================================================
-# CAMINHOS
-# ==================================================
-BASE_DIR = Path(__file__).resolve().parent
+def padronizar_coluna_player(df):
+    for col in df.columns:
+        if col.lower() == "player":
+            df.rename(columns={col: "Player"}, inplace=True)
+            return df
+    
+    df.rename(columns={df.columns[0]: "Player"}, inplace=True)
+    return df
 
-standard_path = BASE_DIR / "Standard.xlsx"
-shooting_path = BASE_DIR / "Shooting.xlsx"
-passing_path  = BASE_DIR / "Passing.xlsx"
-gca_path      = BASE_DIR / "Gca.xlsx"
+def converter_colunas_numericas(df):
+    colunas_texto = ["Player","Nation","Pos","Squad","Comp","Age"]
+    for col in df.columns:
+        if col not in colunas_texto:
+            try:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            except Exception:
+                pass
+    return df
 
-# ==================================================
-# LEITURA DOS ARQUIVOS
-# ==================================================
-standard = ler_fbref_excel(standard_path)
-shooting = ler_fbref_excel(shooting_path)
-passing  = ler_fbref_excel(passing_path)
-gca      = ler_fbref_excel(gca_path)
 
-# ==================================================
-# SELEÇÃO DE COLUNAS (CONFIRMADAS PELO SEU PRINT)
-# ==================================================
-standard = standard[['Player', 'Pos', '90s']].copy()
-shooting = shooting[['Player', 'Sh', 'xG']].copy()
-passing  = passing[['Player', 'KP']].copy()
-gca      = gca[['Player', 'SCA']].copy()
+BASE_PATH = os.path.dirname(__file__)
+standard_path = os.path.join(BASE_PATH, "Standard.xlsx")
+shooting_path = os.path.join(BASE_PATH, "Shooting.xlsx")
+passing_path  = os.path.join(BASE_PATH, "Passing.xlsx")
+gca_path      = os.path.join(BASE_PATH, "Gca.xlsx")
 
-# ==================================================
-# MERGE DOS DADOS
-# ==================================================
+standard = converter_colunas_numericas(padronizar_coluna_player(ler_fbref_excel(standard_path)))
+shooting = converter_colunas_numericas(padronizar_coluna_player(ler_fbref_excel(shooting_path)))
+passing  = converter_colunas_numericas(padronizar_coluna_player(ler_fbref_excel(passing_path)))
+gca      = converter_colunas_numericas(padronizar_coluna_player(ler_fbref_excel(gca_path)))
+
+
 df = (
     standard
-    .merge(shooting, on='Player')
-    .merge(passing, on='Player')
-    .merge(gca, on='Player')
+    .merge(shooting, on="Player", how="left")
+    .merge(passing,  on="Player", how="left")
+    .merge(gca,      on="Player", how="left")
 )
 
-df.dropna(inplace=True)
 
-# ==================================================
-# FILTRO DE MINUTAGEM
-# ==================================================
-df = df[df['90s'] >= 10]
+if "90s" in df.columns:
+    df = df[df["90s"] >= 10]
+else:
+    df["90s"] = 1  
 
-# ==================================================
-# MÉTRICAS POR 90
-# ==================================================
-df['xG_90']  = df['xG'] / df['90s']
-df['Sh_90']  = df['Sh'] / df['90s']
-df['KP_90']  = df['KP'] / df['90s']
-df['SCA_90'] = df['SCA'] / df['90s']
 
-# ==================================================
-# NORMALIZAÇÃO (MIN-MAX)
-# ==================================================
-for col in ['xG_90', 'Sh_90', 'KP_90', 'SCA_90']:
-    df[col + '_norm'] = (df[col] - df[col].min()) / (df[col].max() - df[col].min())
+metricas = ["Gls","xG","Ast","SCA","GCA"]
+metricas = [m for m in metricas if m in df.columns]
 
-# ==================================================
-# ÍNDICE OFENSIVO (AUTORAL)
-# ==================================================
-df['Indice_Ofensivo'] = (
-    0.4  * df['xG_90_norm'] +
-    0.25 * df['Sh_90_norm'] +
-    0.2  * df['SCA_90_norm'] +
-    0.15 * df['KP_90_norm']
-)
+df_final = df.groupby("Player", as_index=False).agg({
+    "90s": "sum",
+    **{m: "sum" for m in metricas}
+})
 
-# ==================================================
-# TOP 10
-# ==================================================
-top10 = df.sort_values('Indice_Ofensivo', ascending=False).head(10)
+for m in metricas:
+    df_final[f"{m}_90"] = df_final[m] / df_final["90s"]
 
-print("\nTOP 10 – ÍNDICE OFENSIVO\n")
-print(top10[['Player', 'Pos', 'Indice_Ofensivo']])
 
-# ==================================================
-# GRÁFICO
-# ==================================================
-plt.figure(figsize=(10, 6))
-plt.barh(top10['Player'], top10['Indice_Ofensivo'])
-plt.title('Top 10 Jogadores – Índice Ofensivo')
-plt.xlabel('Índice Ofensivo')
+pesos = {"xG_90":0.35, "Gls_90":0.25, "SCA_90":0.20, "Ast_90":0.15, "GCA_90":0.05}
+score = 0
+
+for col, peso in pesos.items():
+    if col in df_final.columns:
+        score += df_final[col] * peso
+
+df_final["Score"] = score
+
+
+top10 = df_final.sort_values("Score", ascending=False).head(10)
+
+print("\nTOP 10 JOGADORES (IMPACTO POR 90 MIN):\n")
+print(top10[["Player","Score"]])
+
+plt.figure(figsize=(10,6))
+plt.barh(top10["Player"], top10["Score"])
+plt.xlabel("Score Ofensivo (por 90 min)")
+plt.title("Top 10 Jogadores – Impacto por 90 min")
 plt.gca().invert_yaxis()
 plt.tight_layout()
 plt.show()
